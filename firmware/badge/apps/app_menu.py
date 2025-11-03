@@ -46,10 +46,10 @@ class AppMenu(BaseApp):
         self.page.create_content()
 
         # Load random logo
-        self.add_logo("images/logos/" + str(random.randrange(1, 102)) + ".png")
+        # self.add_logo("images/wrencher.png")
 
         # Header message
-        self.add_message("SUPERCON 2025\nPasadena, CA")
+        self.add_message("SLEEPY\nLos Angeles, CA")
         self.page.create_menubar(self.name_list)
         self.page.replace_screen()
 

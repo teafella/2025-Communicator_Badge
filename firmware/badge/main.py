@@ -28,7 +28,7 @@ async def main():
     badgenet.init(badge)
     # Link them into the menu system here, for starters
     user_apps = [
-        userA.App("User A", badge),
+        userA.App("BT Keyboard", badge),
         userB.App("User B", badge),
         userC.App("User C", badge),
         userD.App("User D", badge),
