@@ -41,7 +41,6 @@ CONSUMER_PLAY_PAUSE = 0xCD
 MOD_LCTRL = 0x01
 MOD_LSHIFT = 0x02
 MOD_LALT = 0x04
-MOD_LGUI = 0x08  # Windows/Command key
 
 
 class SimpleBLEKeyboard:
@@ -229,7 +228,7 @@ class App(BaseApp):
 
     def __init__(self, name: str, badge):
         super().__init__(name, badge)
-        self.foreground_sleep_ms = 20  # Fast polling for key repeat
+        self.foreground_sleep_ms = 100
         self.background_sleep_ms = 1000
         
         # UI elements
@@ -245,19 +244,6 @@ class App(BaseApp):
         self.debug_lines = ["Debug: Starting..."]  # Multiple debug lines
         self.last_key = None
         self.last_key_time = 0
-
-        # Key repeat tracking
-        self.repeat_key = None  # Currently held key for repeat
-        self.repeat_start_time = 0  # Time when key was first pressed
-        self.repeat_last_time = 0  # Time of last repeat
-        self.repeat_initial_delay = 500  # ms before starting to repeat
-        self.repeat_rate = 50  # ms between repeats (20 chars/sec)
-        self.repeat_max_duration = 10000  # Stop repeating after 10 seconds
-        self.keys_pressed = set()  # Track which keys are currently pressed
-        
-        # Track GUI/Windows key for standalone press detection
-        self.meta_was_pressed = False
-        self.meta_press_time = 0
 
         # BLE
         self.ble_keyboard = None
@@ -318,61 +304,17 @@ class App(BaseApp):
             self.switch_to_background()
             return
 
-        # Track meta key state changes for standalone GUI key detection
-        if self.badge.keyboard.meta_pressed and not self.meta_was_pressed:
-            # Meta key just pressed
-            self.meta_was_pressed = True
-            self.meta_press_time = time.ticks_ms()
-        elif not self.badge.keyboard.meta_pressed and self.meta_was_pressed:
-            # Meta key just released - check if it was a standalone press
-            if self.ble_keyboard and self.connected:
-                current_time = time.ticks_ms()
-                press_duration = time.ticks_diff(current_time, self.meta_press_time)
-                # If released within 500ms and no other key was pressed, send standalone GUI key
-                if press_duration < 500 and len(self.keys_pressed) == 0:
-                    try:
-                        report = bytes([MOD_LGUI, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
-                        self._add_debug("Standalone GUI/Windows key")
-                        self.ble_keyboard.gatts_notify(self.conn_handle, self.report_handle, report)
-                        time.sleep_ms(50)
-                        release_report = bytes([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
-                        self.ble_keyboard.gatts_notify(self.conn_handle, self.report_handle, release_report)
-                    except Exception as e:
-                        self._add_debug(f"GUI key failed: {e}")
-            self.meta_was_pressed = False
-            self.keys_pressed.clear()
-
         # Handle regular keys
         key = self.badge.keyboard.read_key()
         if key:
             self.debug_text = f"Key: {key}"
             self.last_key = key
             self.last_key_time = time.ticks_ms()
-            
-            # Track this key for repeat
-            self.keys_pressed.add(key)
-            self.repeat_key = key
-            self.repeat_start_time = time.ticks_ms()
-            self.repeat_last_time = self.repeat_start_time
 
             # Send via BLE if connected
             if self.ble_keyboard and self.connected:
                 self._send_key(key)
                 self._add_debug(f"Sent key: {key}")
-        else:
-            # No new key from keyboard - check for key repeat
-            if self.repeat_key and self.ble_keyboard and self.connected:
-                current_time = time.ticks_ms()
-                time_since_press = time.ticks_diff(current_time, self.repeat_start_time)
-                time_since_repeat = time.ticks_diff(current_time, self.repeat_last_time)
-                
-                # Stop repeating after max duration (safety timeout)
-                if time_since_press >= self.repeat_max_duration:
-                    self.repeat_key = None
-                # Check if we should repeat the key
-                elif time_since_press >= self.repeat_initial_delay and time_since_repeat >= self.repeat_rate:
-                    self._send_key(self.repeat_key)
-                    self.repeat_last_time = current_time
             
         # Check if we've been bonded for a while but Mac still hasn't subscribed
         if (self.bonded and not self.notifications_enabled and self.bonded_time > 0 and 
@@ -782,8 +724,6 @@ class App(BaseApp):
                 modifiers |= MOD_LSHIFT  # Left Shift
             if self.badge.keyboard.alt_pressed:
                 modifiers |= MOD_LALT  # Left Alt
-            if self.badge.keyboard.meta_pressed:
-                modifiers |= MOD_LGUI  # Windows/Command key (Jolly Wrencher)
             
             # Handle uppercase letters (shift already applied at keyboard level, use lowercase code)
             if key.isupper() and key.isalpha():

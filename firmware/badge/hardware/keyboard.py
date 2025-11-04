@@ -178,6 +178,9 @@ class Keyboard:
                 self.alt_pressed = bool(event[0])
             elif self.KEY_MATRIX[event[1]] == self.ESC:  # check if event is esc key
                 self.escape_pressed = bool(event[0])
+                # Also add ESC to keybuffer so it can be sent via BLE keyboard
+                if event[0]:  # Only on press, not release
+                    self.keybuffer.append(self.ESC)
             # Check function keys
             elif self.KEY_MATRIX[event[1]] == self.F1:
                 if bool(event[0]):
@@ -222,13 +225,9 @@ class Keyboard:
                     # If the action is defined, call it
                     if action:
                         action()
-                elif self.control_pressed:
-                    # Don't add key to keybuffer
-                    pass
-                elif self.alt_pressed:
-                    # Don't add key to keybuffer
-                    pass
-                else:  # Otherwise, add the pressed key to the keybuffer
+                else:
+                    # Add key to keybuffer regardless of Ctrl/Alt state
+                    # Apps can check control_pressed/alt_pressed to handle key combinations
                     self.keybuffer.append(key_pressed)
 
     def read_key(self) -> str | None:
