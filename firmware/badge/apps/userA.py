@@ -41,6 +41,7 @@ CONSUMER_PLAY_PAUSE = 0xCD
 MOD_LCTRL = 0x01
 MOD_LSHIFT = 0x02
 MOD_LALT = 0x04
+MOD_LGUI = 0x08  # Left GUI (Windows/Command/Meta key)
 
 
 class SimpleBLEKeyboard:
@@ -254,6 +255,10 @@ class App(BaseApp):
         self.notifications_enabled = False  # Track if Mac subscribed to notifications
         self.bonded_time = 0  # Track when bonding completed
         self.prepared_writes = {}  # Store prepared write data manually
+
+        # Track meta key state for standalone meta key presses
+        self.prev_meta_pressed = False
+        self.meta_sent = False
         
     def start(self):
         """Start the app."""
@@ -315,7 +320,22 @@ class App(BaseApp):
             if self.ble_keyboard and self.connected:
                 self._send_key(key)
                 self._add_debug(f"Sent key: {key}")
-            
+
+        # Handle standalone meta key press (for Windows Start menu / Mac Spotlight)
+        if self.ble_keyboard and self.connected and self.notifications_enabled:
+            meta_currently_pressed = self.badge.keyboard.meta_pressed
+
+            # Meta key was just pressed
+            if meta_currently_pressed and not self.prev_meta_pressed:
+                self._send_meta_key_press()
+                self.meta_sent = True
+            # Meta key was just released
+            elif not meta_currently_pressed and self.prev_meta_pressed and self.meta_sent:
+                self._send_meta_key_release()
+                self.meta_sent = False
+
+            self.prev_meta_pressed = meta_currently_pressed
+
         # Check if we've been bonded for a while but Mac still hasn't subscribed
         if (self.bonded and not self.notifications_enabled and self.bonded_time > 0 and 
             time.ticks_diff(time.ticks_ms(), self.bonded_time) > 5000):  # 5 seconds after bonding
@@ -724,6 +744,8 @@ class App(BaseApp):
                 modifiers |= MOD_LSHIFT  # Left Shift
             if self.badge.keyboard.alt_pressed:
                 modifiers |= MOD_LALT  # Left Alt
+            if self.badge.keyboard.meta_pressed:
+                modifiers |= MOD_LGUI  # Left GUI (Windows/Command/Meta key)
             
             # Handle uppercase letters (shift already applied at keyboard level, use lowercase code)
             if key.isupper() and key.isalpha():
@@ -754,6 +776,33 @@ class App(BaseApp):
             
         except Exception as e:
             self._add_debug(f"Send failed: {e}")
+
+    def _send_meta_key_press(self):
+        """Send a standalone meta/GUI key press (for Windows Start menu / Mac Spotlight)."""
+        if not self.ble_keyboard or not self.connected:
+            return
+
+        try:
+            # Send HID report with just the GUI modifier set (no key code)
+            # Report format: [modifiers, reserved, key1, key2, key3, key4, key5, key6]
+            report = bytes([MOD_LGUI, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+            self._add_debug("Sending Meta key press")
+            self.ble_keyboard.gatts_notify(self.conn_handle, self.report_handle, report)
+        except Exception as e:
+            self._add_debug(f"Meta key press failed: {e}")
+
+    def _send_meta_key_release(self):
+        """Send a standalone meta/GUI key release."""
+        if not self.ble_keyboard or not self.connected:
+            return
+
+        try:
+            # Send key release (all zeros)
+            release_report = bytes([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+            self.ble_keyboard.gatts_notify(self.conn_handle, self.report_handle, release_report)
+            self._add_debug("Sent Meta key release")
+        except Exception as e:
+            self._add_debug(f"Meta key release failed: {e}")
 
     def _send_consumer_control(self, usage_code):
         """Send a consumer control report (for volume, media controls, etc.)."""
