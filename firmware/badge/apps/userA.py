@@ -32,10 +32,16 @@ KEY_CODES = {
     '`l': 0x4F, '`h': 0x50, '`k': 0x51, '`j': 0x52, '\x7f': 0x4C,
 }
 
+# Consumer control codes (for multimedia keys)
+CONSUMER_VOLUME_UP = 0xE9
+CONSUMER_VOLUME_DOWN = 0xEA
+CONSUMER_PLAY_PAUSE = 0xCD
+
 # Modifier keys
 MOD_LCTRL = 0x01
 MOD_LSHIFT = 0x02
 MOD_LALT = 0x04
+MOD_LGUI = 0x08  # Windows/Command key
 
 
 class SimpleBLEKeyboard:
@@ -223,7 +229,7 @@ class App(BaseApp):
 
     def __init__(self, name: str, badge):
         super().__init__(name, badge)
-        self.foreground_sleep_ms = 100
+        self.foreground_sleep_ms = 20  # Fast polling for key repeat
         self.background_sleep_ms = 1000
         
         # UI elements
@@ -239,6 +245,19 @@ class App(BaseApp):
         self.debug_lines = ["Debug: Starting..."]  # Multiple debug lines
         self.last_key = None
         self.last_key_time = 0
+
+        # Key repeat tracking
+        self.repeat_key = None  # Currently held key for repeat
+        self.repeat_start_time = 0  # Time when key was first pressed
+        self.repeat_last_time = 0  # Time of last repeat
+        self.repeat_initial_delay = 500  # ms before starting to repeat
+        self.repeat_rate = 50  # ms between repeats (20 chars/sec)
+        self.repeat_max_duration = 10000  # Stop repeating after 10 seconds
+        self.keys_pressed = set()  # Track which keys are currently pressed
+        
+        # Track GUI/Windows key for standalone press detection
+        self.meta_was_pressed = False
+        self.meta_press_time = 0
 
         # BLE
         self.ble_keyboard = None
@@ -270,6 +289,27 @@ class App(BaseApp):
             self.debug_text = "F1 PRESSED!"
             self._toggle_bluetooth()
 
+        # Handle F2 - play/pause
+        elif self.badge.keyboard.f2():
+            self.debug_text = "F2 PRESSED - PLAY/PAUSE!"
+            if self.ble_keyboard and self.connected:
+                self._send_consumer_control(CONSUMER_PLAY_PAUSE)
+                self._add_debug("Play/Pause")
+
+        # Handle F3 - volume down
+        elif self.badge.keyboard.f3():
+            self.debug_text = "F3 PRESSED - VOL DOWN!"
+            if self.ble_keyboard and self.connected:
+                self._send_consumer_control(CONSUMER_VOLUME_DOWN)
+                self._add_debug("Volume Down")
+
+        # Handle F4 - volume up
+        elif self.badge.keyboard.f4():
+            self.debug_text = "F4 PRESSED - VOL UP!"
+            if self.ble_keyboard and self.connected:
+                self._send_consumer_control(CONSUMER_VOLUME_UP)
+                self._add_debug("Volume Up")
+
         # Handle F5 - exit
         elif self.badge.keyboard.f5():
             self.debug_text = "F5 PRESSED!"
@@ -277,7 +317,31 @@ class App(BaseApp):
             self.badge.display.clear()
             self.switch_to_background()
             return
-            
+
+        # Track meta key state changes for standalone GUI key detection
+        if self.badge.keyboard.meta_pressed and not self.meta_was_pressed:
+            # Meta key just pressed
+            self.meta_was_pressed = True
+            self.meta_press_time = time.ticks_ms()
+        elif not self.badge.keyboard.meta_pressed and self.meta_was_pressed:
+            # Meta key just released - check if it was a standalone press
+            if self.ble_keyboard and self.connected:
+                current_time = time.ticks_ms()
+                press_duration = time.ticks_diff(current_time, self.meta_press_time)
+                # If released within 500ms and no other key was pressed, send standalone GUI key
+                if press_duration < 500 and len(self.keys_pressed) == 0:
+                    try:
+                        report = bytes([MOD_LGUI, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+                        self._add_debug("Standalone GUI/Windows key")
+                        self.ble_keyboard.gatts_notify(self.conn_handle, self.report_handle, report)
+                        time.sleep_ms(50)
+                        release_report = bytes([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+                        self.ble_keyboard.gatts_notify(self.conn_handle, self.report_handle, release_report)
+                    except Exception as e:
+                        self._add_debug(f"GUI key failed: {e}")
+            self.meta_was_pressed = False
+            self.keys_pressed.clear()
+
         # Handle regular keys
         key = self.badge.keyboard.read_key()
         if key:
@@ -285,10 +349,30 @@ class App(BaseApp):
             self.last_key = key
             self.last_key_time = time.ticks_ms()
             
+            # Track this key for repeat
+            self.keys_pressed.add(key)
+            self.repeat_key = key
+            self.repeat_start_time = time.ticks_ms()
+            self.repeat_last_time = self.repeat_start_time
+
             # Send via BLE if connected
             if self.ble_keyboard and self.connected:
                 self._send_key(key)
                 self._add_debug(f"Sent key: {key}")
+        else:
+            # No new key from keyboard - check for key repeat
+            if self.repeat_key and self.ble_keyboard and self.connected:
+                current_time = time.ticks_ms()
+                time_since_press = time.ticks_diff(current_time, self.repeat_start_time)
+                time_since_repeat = time.ticks_diff(current_time, self.repeat_last_time)
+                
+                # Stop repeating after max duration (safety timeout)
+                if time_since_press >= self.repeat_max_duration:
+                    self.repeat_key = None
+                # Check if we should repeat the key
+                elif time_since_press >= self.repeat_initial_delay and time_since_repeat >= self.repeat_rate:
+                    self._send_key(self.repeat_key)
+                    self.repeat_last_time = current_time
             
         # Check if we've been bonded for a while but Mac still hasn't subscribed
         if (self.bonded and not self.notifications_enabled and self.bonded_time > 0 and 
@@ -319,7 +403,7 @@ class App(BaseApp):
             # Create UI without title bar
             self.p = Page()
             self.p.create_content()
-            self.p.create_menubar(["Toggle", "", "", "", "Exit"])
+            self.p.create_menubar(["Toggle", "Play", "Vol-", "Vol+", "Exit"])
 
             # Create multiple debug labels from top to bottom
             self.debug_labels = []
@@ -411,11 +495,18 @@ class App(BaseApp):
                 protocol_char = (HID_PROTOCOL_UUID, bluetooth.FLAG_READ | bluetooth.FLAG_WRITE_NO_RESPONSE)
                 
                 # Input report with descriptors - add INDICATE flag for macOS compatibility
+                # Report ID 1: Keyboard
                 report_char = (HID_REPORT_UUID, bluetooth.FLAG_READ | bluetooth.FLAG_NOTIFY | bluetooth.FLAG_INDICATE, (
                     (CCCD_UUID, bluetooth.FLAG_READ | bluetooth.FLAG_WRITE),
                     (REPORT_REF_UUID, bluetooth.FLAG_READ),
                 ))
-                
+
+                # Report ID 2: Consumer Control (for volume, media keys)
+                consumer_report_char = (HID_REPORT_UUID, bluetooth.FLAG_READ | bluetooth.FLAG_NOTIFY | bluetooth.FLAG_INDICATE, (
+                    (CCCD_UUID, bluetooth.FLAG_READ | bluetooth.FLAG_WRITE),
+                    (REPORT_REF_UUID, bluetooth.FLAG_READ),
+                ))
+
                 # Skip boot keyboard characteristics for now to simplify
                 # boot_kbd_input_char = (HID_BOOT_KBD_INPUT_UUID, bluetooth.FLAG_READ | bluetooth.FLAG_NOTIFY, (
                 #     (CCCD_UUID, bluetooth.FLAG_READ | bluetooth.FLAG_WRITE),
@@ -450,30 +541,33 @@ class App(BaseApp):
                 # Battery Service
                 battery_service = (BATTERY_SERVICE_UUID, (battery_level_char,))
                 
-                # Define simplified HID service without boot protocol
-                hid_service = (HIDS_UUID, (hid_info_char, report_map_char, control_char, protocol_char, report_char))
-                
+                # Define HID service with both keyboard and consumer control reports
+                hid_service = (HIDS_UUID, (hid_info_char, report_map_char, control_char, protocol_char, report_char, consumer_report_char))
+
                 # Register all three mandatory services (DIS, Battery, HID)
                 handles = ble.gatts_register_services((dis_service, battery_service, hid_service))
-                
+
                 # Store handles for all characteristics
                 # Service 0: Device Information Service
                 self.manufacturer_handle = handles[0][0]
                 self.pnp_id_handle = handles[0][1]
-                
+
                 # Service 1: Battery Service
                 self.battery_level_handle = handles[1][0]
                 self.battery_cccd_handle = handles[1][1]  # CCCD descriptor for battery notifications
-                
-                # Service 2: HID Service (simplified)
+
+                # Service 2: HID Service with keyboard and consumer reports
                 self.ble_keyboard = ble
                 self.hid_info_handle = handles[2][0]
-                self.report_map_handle = handles[2][1] 
+                self.report_map_handle = handles[2][1]
                 self.control_handle = handles[2][2]
                 self.protocol_handle = handles[2][3]
                 self.report_handle = handles[2][4]
-                self.cccd_handle = handles[2][5]  # CCCD descriptor for HID reports
-                self.report_ref_handle = handles[2][6]  # Report Reference descriptor
+                self.cccd_handle = handles[2][5]  # CCCD descriptor for keyboard HID reports
+                self.report_ref_handle = handles[2][6]  # Report Reference descriptor for keyboard
+                self.consumer_report_handle = handles[2][7]  # Consumer control report characteristic
+                self.consumer_cccd_handle = handles[2][8]  # CCCD descriptor for consumer reports
+                self.consumer_report_ref_handle = handles[2][9]  # Report Reference descriptor for consumer
                 # Boot keyboard handles removed for simplification
                 self.advertising = False
                 self.connected = False
@@ -497,9 +591,12 @@ class App(BaseApp):
                 # Set protocol mode (Report Protocol = 1, standard mode)
                 # Some devices start in Boot (0) but macOS might prefer Report (1)
                 ble.gatts_write(self.protocol_handle, bytes([0x01]))
-                
-                # Set report reference (Report ID=0, Report Type=Input=1)
-                ble.gatts_write(self.report_ref_handle, bytes([0x00, 0x01]))
+
+                # Set report reference for keyboard report (Report ID=1, Report Type=Input=1)
+                ble.gatts_write(self.report_ref_handle, bytes([0x01, 0x01]))
+
+                # Set report reference for consumer control report (Report ID=2, Report Type=Input=1)
+                ble.gatts_write(self.consumer_report_ref_handle, bytes([0x02, 0x01]))
                 
                 # Try to pre-enable notifications by writing to CCCD
                 # This might help macOS recognize that notifications are available
@@ -509,31 +606,48 @@ class App(BaseApp):
                 except Exception as e:
                     self._add_debug(f"CCCD init failed: {e}")
                 
-                # Simplified HID report map that macOS definitely likes
-                # This is a standard USB HID keyboard descriptor without Report ID
+                # HID report map with both keyboard and consumer control reports
+                # When using separate GATT characteristics, Report IDs in the map correspond to
+                # the Report References but data doesn't include the ID byte
                 report_map = bytes([
+                    # Keyboard report (Report ID 1)
                     0x05, 0x01,  # Usage Page (Generic Desktop)
                     0x09, 0x06,  # Usage (Keyboard)
                     0xA1, 0x01,  # Collection (Application)
-                    0x05, 0x07,  # Usage Page (Keyboard/Keypad)
-                    0x19, 0xE0,  # Usage Minimum (Left Control)
-                    0x29, 0xE7,  # Usage Maximum (Right GUI)
-                    0x15, 0x00,  # Logical Minimum (0)
-                    0x25, 0x01,  # Logical Maximum (1)
-                    0x75, 0x01,  # Report Size (1)
-                    0x95, 0x08,  # Report Count (8)
-                    0x81, 0x02,  # Input (Data,Var,Abs) - Modifier keys
-                    0x95, 0x01,  # Report Count (1)
-                    0x75, 0x08,  # Report Size (8)
-                    0x81, 0x01,  # Input (Const,Array,Abs) - Reserved byte
-                    0x95, 0x06,  # Report Count (6)
-                    0x75, 0x08,  # Report Size (8)
-                    0x15, 0x00,  # Logical Minimum (0)
-                    0x25, 0x65,  # Logical Maximum (101)
-                    0x05, 0x07,  # Usage Page (Keyboard/Keypad)
-                    0x19, 0x00,  # Usage Minimum (0)
-                    0x29, 0x65,  # Usage Maximum (101)
-                    0x81, 0x00,  # Input (Data,Array,Abs) - Key codes
+                    0x85, 0x01,  #   Report ID (1) - Keyboard
+                    0x05, 0x07,  #   Usage Page (Keyboard/Keypad)
+                    0x19, 0xE0,  #   Usage Minimum (Left Control)
+                    0x29, 0xE7,  #   Usage Maximum (Right GUI)
+                    0x15, 0x00,  #   Logical Minimum (0)
+                    0x25, 0x01,  #   Logical Maximum (1)
+                    0x75, 0x01,  #   Report Size (1)
+                    0x95, 0x08,  #   Report Count (8)
+                    0x81, 0x02,  #   Input (Data,Var,Abs) - Modifier keys
+                    0x95, 0x01,  #   Report Count (1)
+                    0x75, 0x08,  #   Report Size (8)
+                    0x81, 0x01,  #   Input (Const,Array,Abs) - Reserved byte
+                    0x95, 0x06,  #   Report Count (6)
+                    0x75, 0x08,  #   Report Size (8)
+                    0x15, 0x00,  #   Logical Minimum (0)
+                    0x25, 0x65,  #   Logical Maximum (101)
+                    0x05, 0x07,  #   Usage Page (Keyboard/Keypad)
+                    0x19, 0x00,  #   Usage Minimum (0)
+                    0x29, 0x65,  #   Usage Maximum (101)
+                    0x81, 0x00,  #   Input (Data,Array,Abs) - Key codes
+                    0xC0,        # End Collection
+
+                    # Consumer Control report (Report ID 2)
+                    0x05, 0x0C,  # Usage Page (Consumer)
+                    0x09, 0x01,  # Usage (Consumer Control)
+                    0xA1, 0x01,  # Collection (Application)
+                    0x85, 0x02,  #   Report ID (2) - Consumer Control
+                    0x15, 0x00,  #   Logical Minimum (0)
+                    0x26, 0xFF, 0x03,  #   Logical Maximum (1023)
+                    0x19, 0x00,  #   Usage Minimum (0)
+                    0x2A, 0xFF, 0x03,  #   Usage Maximum (1023)
+                    0x75, 0x10,  #   Report Size (16)
+                    0x95, 0x01,  #   Report Count (1)
+                    0x81, 0x00,  #   Input (Data,Array,Abs)
                     0xC0         # End Collection
                 ])
                 ble.gatts_write(self.report_map_handle, report_map)
@@ -542,8 +656,10 @@ class App(BaseApp):
                 self._add_debug(f"CCCD handle: {self.cccd_handle}")
                 self._add_debug(f"Report handle: {self.report_handle}")
                 self._add_debug(f"Battery CCCD: {self.battery_cccd_handle}")
-                
-                self._add_debug("Keyboard ready! v15 (CCCD-only prepared writes)")
+                self._add_debug(f"Consumer report: {self.consumer_report_handle}")
+                self._add_debug(f"Consumer CCCD: {self.consumer_cccd_handle}")
+
+                self._add_debug("Keyboard ready! v18 (F2=Play F3=Vol- F4=Vol+)")
 
             except Exception as e:
                 self._add_debug(f"Create failed: {e}")
@@ -646,8 +762,12 @@ class App(BaseApp):
             return
             
         # Get key code from our existing KEY_CODES dictionary
-        key_code = KEY_CODES.get(key.lower(), 0)
+        # Check key as-is first (for special keys like ESC), then try lowercase for letters
+        key_code = KEY_CODES.get(key, 0)
+        if key_code == 0 and hasattr(key, 'lower'):
+            key_code = KEY_CODES.get(key.lower(), 0)
         if key_code == 0:
+            self._add_debug(f"Unknown key: {repr(key)}")
             return  # Unknown key
             
         try:
@@ -655,14 +775,24 @@ class App(BaseApp):
             # Modifiers: Ctrl=1, Shift=2, Alt=4, GUI=8 (left), Ctrl=16, Shift=32, Alt=64, GUI=128 (right)
             modifiers = 0
             
-            # Handle uppercase letters (add shift)
-            if key.isupper() and key.isalpha():
-                modifiers |= 0x02  # Left Shift
-                key_code = KEY_CODES.get(key.lower(), 0)  # Use lowercase key code
+            # Check all modifier keys (can be combined, e.g., Ctrl+Shift+ESC)
+            if self.badge.keyboard.control_pressed:
+                modifiers |= MOD_LCTRL  # Left Control
+            if self.badge.keyboard.shift_pressed:
+                modifiers |= MOD_LSHIFT  # Left Shift
+            if self.badge.keyboard.alt_pressed:
+                modifiers |= MOD_LALT  # Left Alt
+            if self.badge.keyboard.meta_pressed:
+                modifiers |= MOD_LGUI  # Windows/Command key (Jolly Wrencher)
             
-            # Send key press without Report ID (new simplified format)
+            # Handle uppercase letters (shift already applied at keyboard level, use lowercase code)
+            if key.isupper() and key.isalpha():
+                modifiers |= MOD_LSHIFT  # Left Shift (in case shift wasn't detected via shift_pressed)
+                key_code = KEY_CODES.get(key.lower(), 0)  # Use lowercase key code
+
+            # Send key press WITHOUT Report ID (Report Reference descriptor specifies the ID)
             report = bytes([modifiers, 0x00, key_code, 0x00, 0x00, 0x00, 0x00, 0x00])
-            self._add_debug(f"Sending: mod={modifiers:02x} key={key_code:02x}")
+            self._add_debug(f"Sending: mod={modifiers:02x} key={key_code:02x} key={repr(key)}")
             # Try notification first, fall back to indication
             try:
                 self.ble_keyboard.gatts_notify(self.conn_handle, self.report_handle, report)
@@ -673,18 +803,52 @@ class App(BaseApp):
                 except Exception as indicate_e:
                     self._add_debug(f"Indicate also failed: {indicate_e}")
                     raise
-            
+
             # Small delay then send key release
             import time
             time.sleep_ms(50)
-            
-            # Send key release (all zeros) without Report ID
+
+            # Send key release (all zeros) WITHOUT Report ID
             release_report = bytes([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
             self.ble_keyboard.gatts_notify(self.conn_handle, self.report_handle, release_report)
             
         except Exception as e:
             self._add_debug(f"Send failed: {e}")
-        
+
+    def _send_consumer_control(self, usage_code):
+        """Send a consumer control report (for volume, media controls, etc.)."""
+        if not self.ble_keyboard or not self.connected:
+            return
+
+        if not self.notifications_enabled:
+            self._add_debug("Mac hasn't subscribed to notifications yet!")
+            return
+
+        try:
+            # Consumer control report: [usage_code_low, usage_code_high]
+            # HID consumer control uses 16-bit usage codes in little-endian format
+            # No Report ID needed - it's specified in the Report Reference descriptor
+            report = bytes([usage_code, 0x00])
+            self._add_debug(f"Sending consumer: 0x{usage_code:02x}")
+
+            # Send consumer control press
+            try:
+                self.ble_keyboard.gatts_notify(self.conn_handle, self.consumer_report_handle, report)
+            except Exception as notify_e:
+                self._add_debug(f"Consumer notify failed: {notify_e}")
+                return
+
+            # Small delay then send release
+            import time
+            time.sleep_ms(50)
+
+            # Send release (all zeros) WITHOUT Report ID
+            release_report = bytes([0x00, 0x00])
+            self.ble_keyboard.gatts_notify(self.conn_handle, self.consumer_report_handle, release_report)
+
+        except Exception as e:
+            self._add_debug(f"Consumer control send failed: {e}")
+
     def _ble_irq(self, event, data):
         """Handle BLE events."""
         try:
@@ -714,20 +878,32 @@ class App(BaseApp):
                 conn_handle, value_handle = data
                 self._add_debug(f"Mac wrote to handle {value_handle}")
                 if value_handle == self.cccd_handle:
-                    # Client subscribed to notifications - this is critical!
+                    # Client subscribed to keyboard notifications - this is critical!
                     value = self.ble_keyboard.gatts_read(value_handle)
-                    self._add_debug(f"HID CCCD written: {value.hex()}")
+                    self._add_debug(f"Keyboard CCCD written: {value.hex()}")
                     if value == b'\x01\x00':
-                        self._add_debug("Mac SUBSCRIBED to HID notifications!")
+                        self._add_debug("Mac SUBSCRIBED to keyboard notifications!")
                         self.notifications_enabled = True
                     elif value == b'\x02\x00':
-                        self._add_debug("Mac SUBSCRIBED to HID indications!")
+                        self._add_debug("Mac SUBSCRIBED to keyboard indications!")
                         self.notifications_enabled = True
                     elif value == b'\x00\x00':
-                        self._add_debug("Mac UNSUBSCRIBED from HID notifications")
+                        self._add_debug("Mac UNSUBSCRIBED from keyboard notifications")
                         self.notifications_enabled = False
                     else:
-                        self._add_debug(f"Mac wrote unknown CCCD value: {value.hex()}")
+                        self._add_debug(f"Mac wrote unknown keyboard CCCD value: {value.hex()}")
+                elif value_handle == self.consumer_cccd_handle:
+                    # Client subscribed to consumer control notifications
+                    value = self.ble_keyboard.gatts_read(value_handle)
+                    self._add_debug(f"Consumer CCCD written: {value.hex()}")
+                    if value == b'\x01\x00':
+                        self._add_debug("Mac SUBSCRIBED to consumer notifications!")
+                    elif value == b'\x02\x00':
+                        self._add_debug("Mac SUBSCRIBED to consumer indications!")
+                    elif value == b'\x00\x00':
+                        self._add_debug("Mac UNSUBSCRIBED from consumer notifications")
+                    else:
+                        self._add_debug(f"Mac wrote unknown consumer CCCD value: {value.hex()}")
                 # Boot keyboard handling removed for simplification
                 elif value_handle == self.battery_cccd_handle:
                     # Battery notifications
@@ -784,17 +960,21 @@ class App(BaseApp):
                         battery_level = bytes([95])  # Slight change in battery level
                         self.ble_keyboard.gatts_write(self.battery_level_handle, battery_level)
                         self._add_debug("Sent battery update to wake up Mac GATT")
-                        
-                        # Also try manually enabling notifications on the HID CCCD
+
+                        # Also try manually enabling notifications on the HID CCCDs
                         # Some devices need this to work properly with macOS
                         try:
-                            # Write notification enable value to CCCD 
+                            # Write notification enable value to keyboard CCCD
                             self.ble_keyboard.gatts_write(self.cccd_handle, b'\x01\x00')
-                            self._add_debug("Manually enabled HID notifications")
+                            self._add_debug("Manually enabled keyboard notifications")
                             self.notifications_enabled = True
+
+                            # Also enable consumer control CCCD
+                            self.ble_keyboard.gatts_write(self.consumer_cccd_handle, b'\x01\x00')
+                            self._add_debug("Manually enabled consumer notifications")
                         except Exception as cccd_e:
                             self._add_debug(f"Manual CCCD enable failed: {cccd_e}")
-                            
+
                     except Exception as e:
                         self._add_debug(f"Battery update failed: {e}")
                 elif encrypted:
@@ -850,30 +1030,42 @@ class App(BaseApp):
 
                     if status == 1:
                         # Status 1 = execute prepared writes
-                        # Check if CCCD was actually updated
+                        # Check if keyboard CCCD was actually updated
                         cccd_value = self.ble_keyboard.gatts_read(self.cccd_handle)
-                        self._add_debug(f"HID CCCD after execute: {cccd_value.hex() if cccd_value else 'None'}")
+                        self._add_debug(f"Keyboard CCCD after execute: {cccd_value.hex() if cccd_value else 'None'}")
 
                         if cccd_value == b'\x01\x00' or cccd_value == b'\x02\x00':
-                            # CCCD was properly updated!
-                            self._add_debug("NOTIFICATIONS ENABLED via CCCD!")
+                            # Keyboard CCCD was properly updated!
+                            self._add_debug("KEYBOARD NOTIFICATIONS ENABLED via CCCD!")
                             self.notifications_enabled = True
                         elif cccd_value == b'\x00\x00':
                             # CCCD still disabled - prepared write failed due to MicroPython bug
                             # Manually write to CCCD to enable notifications
-                            self._add_debug("WORKAROUND: Manually writing CCCD to enable notifications")
+                            self._add_debug("WORKAROUND: Manually writing keyboard CCCD to enable notifications")
                             try:
                                 # Write notification enable value (0x0001 in little-endian)
                                 self.ble_keyboard.gatts_write(self.cccd_handle, b'\x01\x00')
                                 # Verify it was written
                                 new_value = self.ble_keyboard.gatts_read(self.cccd_handle)
-                                self._add_debug(f"CCCD after manual write: {new_value.hex()}")
+                                self._add_debug(f"Keyboard CCCD after manual write: {new_value.hex()}")
                                 self.notifications_enabled = True
-                                self._add_debug("NOTIFICATIONS ENABLED via manual CCCD write!")
+                                self._add_debug("KEYBOARD NOTIFICATIONS ENABLED via manual CCCD write!")
                             except Exception as e:
-                                self._add_debug(f"Manual CCCD write failed: {e}")
+                                self._add_debug(f"Manual keyboard CCCD write failed: {e}")
                         else:
-                            self._add_debug(f"Unexpected CCCD value: {cccd_value.hex()}")
+                            self._add_debug(f"Unexpected keyboard CCCD value: {cccd_value.hex()}")
+
+                        # Also check consumer control CCCD
+                        try:
+                            consumer_cccd_value = self.ble_keyboard.gatts_read(self.consumer_cccd_handle)
+                            self._add_debug(f"Consumer CCCD after execute: {consumer_cccd_value.hex() if consumer_cccd_value else 'None'}")
+                            if consumer_cccd_value == b'\x00\x00':
+                                # Consumer CCCD needs manual enabling too
+                                self._add_debug("WORKAROUND: Manually writing consumer CCCD")
+                                self.ble_keyboard.gatts_write(self.consumer_cccd_handle, b'\x01\x00')
+                                self._add_debug("Consumer CCCD enabled!")
+                        except Exception as e:
+                            self._add_debug(f"Consumer CCCD check failed: {e}")
                     elif status == 2:
                         # Status 2 = cancel prepared writes
                         self._add_debug("Event 30: Prepared writes cancelled")
@@ -890,11 +1082,17 @@ class App(BaseApp):
                 elif value_handle == self.battery_level_handle:
                     self._add_debug("Mac reading Battery Level!")
                 elif value_handle == self.report_handle:
-                    self._add_debug("Mac reading HID Report characteristic!")
+                    self._add_debug("Mac reading keyboard report characteristic!")
+                elif value_handle == self.consumer_report_handle:
+                    self._add_debug("Mac reading consumer report characteristic!")
                 elif value_handle == self.cccd_handle:
-                    self._add_debug("Mac reading HID CCCD descriptor!")
+                    self._add_debug("Mac reading keyboard CCCD descriptor!")
+                elif value_handle == self.consumer_cccd_handle:
+                    self._add_debug("Mac reading consumer CCCD descriptor!")
                 elif value_handle == self.report_ref_handle:
-                    self._add_debug("Mac reading Report Reference!")
+                    self._add_debug("Mac reading keyboard report reference!")
+                elif value_handle == self.consumer_report_ref_handle:
+                    self._add_debug("Mac reading consumer report reference!")
                 elif value_handle == self.protocol_handle:
                     self._add_debug("Mac reading Protocol Mode!")
                     # When Mac reads protocol mode, it's often getting ready to subscribe
